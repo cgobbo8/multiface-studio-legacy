@@ -1,0 +1,331 @@
+diff --git a/facefusion/choices.py b/facefusion/choices.py
+index 374ce63..fb552a4 100755
+--- a/facefusion/choices.py
++++ b/facefusion/choices.py
+@@ -14,7 +14,7 @@ face_detector_set : FaceDetectorSet =\
+ }
+ face_detector_models : List[FaceDetectorModel] = list(get_args(FaceDetectorModel))
+ face_landmarker_models : List[FaceLandmarkerModel] = list(get_args(FaceLandmarkerModel))
+-face_selector_modes : List[FaceSelectorMode] = list(get_args(FaceSelectorMode))
++face_selector_modes : List[FaceSelectorMode] = [ face_selector_mode for face_selector_mode in get_args(FaceSelectorMode) if face_selector_mode != 'mapping' ]
+ face_selector_orders : List[FaceSelectorOrder] = list(get_args(FaceSelectorOrder))
+ face_selector_genders : List[Gender] = list(get_args(Gender))
+ face_selector_races : List[Race] = list(get_args(Race))
+diff --git a/facefusion/face_mapper.py b/facefusion/face_mapper.py
+new file mode 100644
+index 0000000..780d09b
+--- /dev/null
++++ b/facefusion/face_mapper.py
+@@ -0,0 +1,81 @@
++from typing import List, Optional, Tuple
++
++import numpy
++
++from facefusion import state_manager
++from facefusion.common_helper import get_first
++from facefusion.face_analyser import get_average_face, get_many_faces
++from facefusion.types import Face, FaceMapping, VisionFrame
++from facefusion.vision import read_static_image, read_static_images
++
++
++def get_face_mappings() -> List[FaceMapping]:
++	return state_manager.get_item('face_mappings') or []
++
++
++def has_face_mapping_source() -> bool:
++	for face_mapping in get_face_mappings():
++		if get_face_mapping_source_face(face_mapping):
++			return True
++	return False
++
++
++def calculate_face_mapping_distance(face : Face, face_mapping : FaceMapping) -> float:
++	face_distances = [ 1 - numpy.dot(face.embedding_norm, reference_embedding) for reference_embedding in face_mapping.get('reference_embeddings') ]
++
++	if face_distances:
++		return float(numpy.interp(min(face_distances), [ 0, 2 ], [ 0, 1 ]))
++	return 1.0
++
++
++def match_face_mappings(target_faces : List[Face], face_mappings : List[FaceMapping], face_distance : float) -> List[Tuple[Face, FaceMapping]]:
++	match_candidates = []
++	match_pairs = []
++	used_target_indices = set()
++	used_mapping_indices = set()
++
++	for target_index, target_face in enumerate(target_faces):
++		for mapping_index, face_mapping in enumerate(face_mappings):
++			current_face_distance = calculate_face_mapping_distance(target_face, face_mapping)
++
++			if current_face_distance < face_distance:
++				match_candidates.append((current_face_distance, target_index, mapping_index))
++
++	# closest pairs win first so two similar looking people never share the same mapping
++	for _, target_index, mapping_index in sorted(match_candidates):
++		if target_index not in used_target_indices and mapping_index not in used_mapping_indices:
++			used_target_indices.add(target_index)
++			used_mapping_indices.add(mapping_index)
++			match_pairs.append((target_faces[target_index], face_mappings[mapping_index]))
++
++	return match_pairs
++
++
++def select_mapped_faces(target_vision_frame : VisionFrame) -> List[Tuple[Face, FaceMapping]]:
++	target_faces = get_many_faces([ target_vision_frame ])
++	match_pairs = match_face_mappings(target_faces, get_face_mappings(), state_manager.get_item('reference_face_distance'))
++	return [ (target_face, face_mapping) for target_face, face_mapping in match_pairs if face_mapping.get('source_paths') ]
++
++
++def get_face_mapping_source_face(face_mapping : FaceMapping) -> Optional[Face]:
++	source_faces = []
++
++	for source_vision_frame in read_static_images(face_mapping.get('source_paths') or []):
++		temp_faces = get_many_faces([ source_vision_frame ])
++
++		if temp_faces:
++			source_faces.append(max(temp_faces, key = get_bounding_box_area))
++
++	return get_average_face(source_faces)
++
++
++def get_face_mapping_source_frame(face_mapping : FaceMapping) -> Optional[VisionFrame]:
++	source_path = get_first(face_mapping.get('source_paths'))
++
++	if source_path:
++		return read_static_image(source_path)
++	return None
++
++
++def get_bounding_box_area(face : Face) -> float:
++	return (face.bounding_box[2] - face.bounding_box[0]) * (face.bounding_box[3] - face.bounding_box[1])
+diff --git a/facefusion/face_selector.py b/facefusion/face_selector.py
+index 00459e9..298c373 100644
+--- a/facefusion/face_selector.py
++++ b/facefusion/face_selector.py
+@@ -4,10 +4,14 @@ import numpy
+ 
+ from facefusion import state_manager
+ from facefusion.face_analyser import get_many_faces, get_one_face
++from facefusion.face_mapper import select_mapped_faces
+ from facefusion.types import Face, FaceSelectorOrder, Gender, Race, Score, VisionFrame
+ 
+ 
+ def select_faces(reference_vision_frame : VisionFrame, target_vision_frame : VisionFrame) -> List[Face]:
++	if state_manager.get_item('face_selector_mode') == 'mapping':
++		return [ target_face for target_face, _ in select_mapped_faces(target_vision_frame) ]
++
+ 	target_faces = get_many_faces([ target_vision_frame ])
+ 
+ 	if state_manager.get_item('face_selector_mode') == 'many':
+diff --git a/facefusion/processors/modules/face_swapper/core.py b/facefusion/processors/modules/face_swapper/core.py
+index 9e906ad..10d9c62 100755
+--- a/facefusion/processors/modules/face_swapper/core.py
++++ b/facefusion/processors/modules/face_swapper/core.py
+@@ -13,6 +13,7 @@ from facefusion.common_helper import get_first, is_macos
+ from facefusion.download import conditional_download_hashes, conditional_download_sources, resolve_download_url
+ from facefusion.execution import has_execution_provider
+ from facefusion.face_analyser import get_average_face, get_many_faces, get_one_face, scale_face
++from facefusion.face_mapper import get_face_mapping_source_face, get_face_mapping_source_frame, has_face_mapping_source, select_mapped_faces
+ from facefusion.face_helper import paste_back, warp_face_by_face_landmark_5
+ from facefusion.face_masker import create_area_mask, create_box_mask, create_occlusion_mask, create_region_mask
+ from facefusion.face_selector import select_faces, sort_faces_by_order
+@@ -535,17 +536,22 @@ def pre_check() -> bool:
+ 
+ 
+ def pre_process(mode : ProcessMode) -> bool:
+-	if not has_image(state_manager.get_item('source_paths')):
+-		logger.error(translator.get('choose_image_source') + translator.get('exclamation_mark'), __name__)
+-		return False
+-
+-	source_image_paths = filter_image_paths(state_manager.get_item('source_paths'))
+-	source_frames = read_static_images(source_image_paths)
+-	source_faces = get_many_faces(source_frames)
+-
+-	if not get_one_face(source_faces):
+-		logger.error(translator.get('no_source_face_detected') + translator.get('exclamation_mark'), __name__)
+-		return False
++	if state_manager.get_item('face_selector_mode') == 'mapping':
++		if not has_face_mapping_source():
++			logger.error(translator.get('no_source_face_detected') + translator.get('exclamation_mark'), __name__)
++			return False
++	else:
++		if not has_image(state_manager.get_item('source_paths')):
++			logger.error(translator.get('choose_image_source') + translator.get('exclamation_mark'), __name__)
++			return False
++
++		source_image_paths = filter_image_paths(state_manager.get_item('source_paths'))
++		source_frames = read_static_images(source_image_paths)
++		source_faces = get_many_faces(source_frames)
++
++		if not get_one_face(source_faces):
++			logger.error(translator.get('no_source_face_detected') + translator.get('exclamation_mark'), __name__)
++			return False
+ 
+ 	if mode in [ 'output', 'preview' ] and not is_image(state_manager.get_item('target_path')) and not is_video(state_manager.get_item('target_path')):
+ 		logger.error(translator.get('choose_image_or_video_target') + translator.get('exclamation_mark'), __name__)
+@@ -578,7 +584,7 @@ def post_process() -> None:
+ 		face_recognizer.clear_inference_pool()
+ 
+ 
+-def swap_face(source_face : Face, target_face : Face, temp_vision_frame : VisionFrame) -> VisionFrame:
++def swap_face(source_face : Face, target_face : Face, temp_vision_frame : VisionFrame, source_vision_frame : Optional[VisionFrame] = None) -> VisionFrame:
+ 	model_template = get_model_options().get('template')
+ 	model_size = get_model_options().get('size')
+ 	pixel_boost_size = unpack_resolution(state_manager.get_item('face_swapper_pixel_boost'))
+@@ -598,7 +604,7 @@ def swap_face(source_face : Face, target_face : Face, temp_vision_frame : Vision
+ 	pixel_boost_vision_frames = implode_pixel_boost(crop_vision_frame, pixel_boost_total, model_size)
+ 	for pixel_boost_vision_frame in pixel_boost_vision_frames:
+ 		pixel_boost_vision_frame = prepare_crop_frame(pixel_boost_vision_frame)
+-		pixel_boost_vision_frame = forward_swap_face(source_face, target_face, pixel_boost_vision_frame)
++		pixel_boost_vision_frame = forward_swap_face(source_face, target_face, pixel_boost_vision_frame, source_vision_frame)
+ 		pixel_boost_vision_frame = normalize_crop_frame(pixel_boost_vision_frame)
+ 		temp_vision_frames.append(pixel_boost_vision_frame)
+ 	crop_vision_frame = explode_pixel_boost(temp_vision_frames, pixel_boost_total, model_size, pixel_boost_size)
+@@ -617,7 +623,7 @@ def swap_face(source_face : Face, target_face : Face, temp_vision_frame : Vision
+ 	return paste_vision_frame
+ 
+ 
+-def forward_swap_face(source_face : Face, target_face : Face, crop_vision_frame : VisionFrame) -> VisionFrame:
++def forward_swap_face(source_face : Face, target_face : Face, crop_vision_frame : VisionFrame, source_vision_frame : Optional[VisionFrame] = None) -> VisionFrame:
+ 	face_swapper = get_inference_pool().get('face_swapper')
+ 	model_type = get_model_options().get('type')
+ 	face_swapper_inputs = {}
+@@ -628,7 +634,7 @@ def forward_swap_face(source_face : Face, target_face : Face, crop_vision_frame
+ 	for face_swapper_input in face_swapper.get_inputs():
+ 		if face_swapper_input.name == 'source':
+ 			if model_type in [ 'blendswap', 'uniface' ]:
+-				face_swapper_inputs[face_swapper_input.name] = prepare_source_frame(source_face)
++				face_swapper_inputs[face_swapper_input.name] = prepare_source_frame(source_face, source_vision_frame)
+ 			else:
+ 				source_embedding = prepare_source_embedding(source_face)
+ 				source_embedding = balance_source_embedding(source_embedding, target_face.embedding)
+@@ -654,9 +660,11 @@ def forward_convert_embedding(face_embedding : Embedding) -> Embedding:
+ 	return face_embedding
+ 
+ 
+-def prepare_source_frame(source_face : Face) -> VisionFrame:
++def prepare_source_frame(source_face : Face, source_vision_frame : Optional[VisionFrame] = None) -> VisionFrame:
+ 	model_type = get_model_options().get('type')
+-	source_vision_frame = read_static_image(get_first(state_manager.get_item('source_paths')))
++
++	if source_vision_frame is None:
++		source_vision_frame = read_static_image(get_first(state_manager.get_item('source_paths')))
+ 
+ 	if model_type == 'blendswap':
+ 		source_vision_frame, _ = warp_face_by_face_landmark_5(source_vision_frame, source_face.landmark_set.get('5/68'), 'arcface_112_v2', (112, 112))
+@@ -763,6 +771,16 @@ def process_frame(inputs : FaceSwapperInputs) -> ProcessorOutputs:
+ 	target_vision_frame = inputs.get('target_vision_frame')
+ 	temp_vision_frame = inputs.get('temp_vision_frame')
+ 	temp_vision_mask = inputs.get('temp_vision_mask')
++
++	if state_manager.get_item('face_selector_mode') == 'mapping':
++		for target_face, face_mapping in select_mapped_faces(target_vision_frame):
++			source_face = get_face_mapping_source_face(face_mapping)
++
++			if source_face:
++				target_face = scale_face(target_face, target_vision_frame, temp_vision_frame)
++				temp_vision_frame = swap_face(source_face, target_face, temp_vision_frame, get_face_mapping_source_frame(face_mapping))
++		return temp_vision_frame, temp_vision_mask
++
+ 	source_face = extract_source_face(source_vision_frames)
+ 	target_faces = select_faces(reference_vision_frame, target_vision_frame)
+ 
+diff --git a/facefusion/types.py b/facefusion/types.py
+index f32b535..122fdbc 100755
+--- a/facefusion/types.py
++++ b/facefusion/types.py
+@@ -45,6 +45,11 @@ Face = namedtuple('Face',
+ 	'race'
+ ])
+ FaceSet : TypeAlias = Dict[str, List[Face]]
++FaceMapping = TypedDict('FaceMapping',
++{
++	'reference_embeddings' : List[Embedding],
++	'source_paths' : List[str]
++})
+ FaceStore = TypedDict('FaceStore',
+ {
+ 	'static_faces' : FaceSet
+@@ -118,7 +123,7 @@ TableContent : TypeAlias = Any
+ FaceDetectorModel = Literal['many', 'retinaface', 'scrfd', 'yolo_face', 'yunet']
+ FaceLandmarkerModel = Literal['many', '2dfan4', 'peppa_wutz']
+ FaceDetectorSet : TypeAlias = Dict[FaceDetectorModel, List[str]]
+-FaceSelectorMode = Literal['many', 'one', 'reference']
++FaceSelectorMode = Literal['many', 'one', 'reference', 'mapping']
+ FaceSelectorOrder = Literal['left-right', 'right-left', 'top-bottom', 'bottom-top', 'small-large', 'large-small', 'best-worst', 'worst-best']
+ FaceOccluderModel = Literal['many', 'xseg_1', 'xseg_2', 'xseg_3']
+ FaceParserModel = Literal['bisenet_resnet_18', 'bisenet_resnet_34']
+@@ -290,6 +295,7 @@ StateKey = Literal\
+ 	'reference_face_position',
+ 	'reference_face_distance',
+ 	'reference_frame_number',
++	'face_mappings',
+ 	'face_occluder_model',
+ 	'face_parser_model',
+ 	'face_mask_types',
+@@ -360,6 +366,7 @@ State = TypedDict('State',
+ 	'reference_face_position' : int,
+ 	'reference_face_distance' : float,
+ 	'reference_frame_number' : int,
++	'face_mappings' : List[FaceMapping],
+ 	'face_occluder_model' : FaceOccluderModel,
+ 	'face_parser_model' : FaceParserModel,
+ 	'face_mask_types' : List[FaceMaskType],
+diff --git a/facefusion/video_manager.py b/facefusion/video_manager.py
+index 8923afb..87e023c 100644
+--- a/facefusion/video_manager.py
++++ b/facefusion/video_manager.py
+@@ -1,5 +1,8 @@
++import threading
++
+ import cv2
+ 
++from facefusion.thread_helper import thread_semaphore
+ from facefusion.types import VideoPoolSet
+ 
+ VIDEO_POOL_SET : VideoPoolSet =\
+@@ -7,16 +10,19 @@ VIDEO_POOL_SET : VideoPoolSet =\
+ 	'capture': {},
+ 	'writer': {}
+ }
++VIDEO_POOL_LOCK : threading.Lock = threading.Lock()
+ 
+ 
+ def get_video_capture(video_path : str) -> cv2.VideoCapture:
+-	if video_path not in VIDEO_POOL_SET.get('capture'):
+-		video_capture = cv2.VideoCapture(video_path)
++	# worker threads race here on their first frame, a second capture would be destroyed while ffmpeg still decodes
++	with VIDEO_POOL_LOCK:
++		if video_path not in VIDEO_POOL_SET.get('capture'):
++			video_capture = cv2.VideoCapture(video_path)
+ 
+-		if video_capture.isOpened():
+-			VIDEO_POOL_SET['capture'][video_path] = video_capture
++			if video_capture.isOpened():
++				VIDEO_POOL_SET['capture'][video_path] = video_capture
+ 
+-	return VIDEO_POOL_SET.get('capture').get(video_path)
++		return VIDEO_POOL_SET.get('capture').get(video_path)
+ 
+ 
+ def get_video_writer(video_path : str) -> cv2.VideoWriter:
+@@ -30,11 +36,13 @@ def get_video_writer(video_path : str) -> cv2.VideoWriter:
+ 
+ 
+ def clear_video_pool() -> None:
+-	for video_capture in VIDEO_POOL_SET.get('capture').values():
+-		video_capture.release()
++	# releasing during a decode from another thread aborts inside libavcodec (pthread_frame async_lock)
++	with thread_semaphore(), VIDEO_POOL_LOCK:
++		for video_capture in VIDEO_POOL_SET.get('capture').values():
++			video_capture.release()
+ 
+-	for video_writer in VIDEO_POOL_SET.get('writer').values():
+-		video_writer.release()
++		for video_writer in VIDEO_POOL_SET.get('writer').values():
++			video_writer.release()
+ 
+-	VIDEO_POOL_SET['capture'].clear()
+-	VIDEO_POOL_SET['writer'].clear()
++		VIDEO_POOL_SET['capture'].clear()
++		VIDEO_POOL_SET['writer'].clear()

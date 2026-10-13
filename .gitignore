@@ -1,0 +1,10 @@
+# created by install.js
+.env/
+app/engine/
+
+# created at runtime
+app/workspace/
+logs/
+cache/
+__pycache__/
+.DS_Store
