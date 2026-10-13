@@ -13,19 +13,28 @@ index 374ce63..fb552a4 100755
  face_selector_races : List[Race] = list(get_args(Race))
 diff --git a/facefusion/face_mapper.py b/facefusion/face_mapper.py
 new file mode 100644
-index 0000000..9884884
+index 0000000..63c4a25
 --- /dev/null
 +++ b/facefusion/face_mapper.py
-@@ -0,0 +1,93 @@
-+from typing import List, Optional, Tuple
+@@ -0,0 +1,243 @@
++import hashlib
++import math
++from concurrent.futures import ThreadPoolExecutor
++from typing import Dict, List, Optional, Tuple
 +
 +import numpy
 +
-+from facefusion import state_manager
++from facefusion import process_manager, state_manager
 +from facefusion.common_helper import get_first
 +from facefusion.face_analyser import get_average_face, get_many_faces
 +from facefusion.types import Face, FaceMapping, VisionFrame
-+from facefusion.vision import read_static_image, read_static_images
++from facefusion.vision import read_image, read_static_image, read_static_images
++
++# seconds a briefly undetected face keeps being processed, bridged between the frames around the miss
++FACE_TRACK_GAP = 0.25
++FACE_TRACK_SET : Dict[str, List[Tuple[Face, FaceMapping]]] = {}
++FACE_TRACK_FRAMES : List[Dict[int, Face]] = []
++FACE_TRACK_TOKEN : List[Tuple[int, int]] = []
 +
 +
 +def get_face_mappings() -> List[FaceMapping]:
@@ -83,9 +92,150 @@ index 0000000..9884884
 +
 +
 +def match_target_faces(target_vision_frame : VisionFrame) -> List[Tuple[Face, FaceMapping]]:
++	# inside a prepared video the tracked faces win, they include the bridged misses
++	if FACE_TRACK_SET:
++		tracked_pairs = FACE_TRACK_SET.get(create_frame_key(target_vision_frame))
++
++		if tracked_pairs is not None:
++			return tracked_pairs
++
 +	# every mapping takes part so swapped, stickered and untouched people never steal each other's faces
 +	target_faces = get_many_faces([ target_vision_frame ])
 +	return match_face_mappings(target_faces, get_face_mappings(), state_manager.get_item('reference_face_distance'))
++
++
++def create_frame_key(vision_frame : VisionFrame) -> str:
++	# crc32 collides too often over thousands of frames, a wrong hit would paste faces from another frame
++	return hashlib.blake2b(numpy.ascontiguousarray(vision_frame).data, digest_size = 16).hexdigest()
++
++
++def get_tracked_faces() -> List[Dict[int, Face]]:
++	return FACE_TRACK_FRAMES
++
++
++def clear_face_tracks() -> None:
++	FACE_TRACK_SET.clear()
++	FACE_TRACK_FRAMES.clear()
++	FACE_TRACK_TOKEN.clear()
++
++
++def prepare_face_tracks(temp_frame_paths : List[str]) -> None:
++	track_token = (id(temp_frame_paths), len(temp_frame_paths))
++
++	# several processors prepare the same render, the video is analysed once
++	if track_token in FACE_TRACK_TOKEN:
++		return
++
++	clear_face_tracks()
++	FACE_TRACK_TOKEN.append(track_token)
++	face_mappings = get_face_mappings()
++	track_indices = [ index for index, face_mapping in enumerate(face_mappings) if face_mapping.get('source_paths') or face_mapping.get('sticker_path') ]
++
++	if not track_indices:
++		return
++
++	frame_total = len(temp_frame_paths)
++	frame_keys : List[Optional[str]] = [ None ] * frame_total
++	frame_faces : List[List[Face]] = [ [] for _ in range(frame_total) ]
++	matched_faces : List[Dict[int, Face]] = [ {} for _ in range(frame_total) ]
++
++	with ThreadPoolExecutor(max_workers = state_manager.get_item('execution_thread_count')) as executor:
++		for frame_number, frame_key, target_faces, frame_matches in executor.map(analyse_track_frame, range(frame_total), temp_frame_paths):
++			frame_keys[frame_number] = frame_key
++			frame_faces[frame_number] = target_faces
++			matched_faces[frame_number] = frame_matches
++
++	tracked_faces = [ dict(frame_matches) for frame_matches in matched_faces ]
++	gap_total = max(1, round((state_manager.get_item('output_video_fps') or 25.0) * FACE_TRACK_GAP))
++
++	for mapping_index in track_indices:
++		known_numbers = [ frame_number for frame_number in range(frame_total) if mapping_index in matched_faces[frame_number] ]
++
++		for start_number, end_number in zip(known_numbers[:-1], known_numbers[1:]):
++			start_face = matched_faces[start_number].get(mapping_index)
++			end_face = matched_faces[end_number].get(mapping_index)
++
++			if 1 < end_number - start_number <= gap_total + 1 and is_face_bridgeable(start_face, end_face):
++				for frame_number in range(start_number + 1, end_number):
++					estimate_face = interpolate_face(start_face, end_face, (frame_number - start_number) / (end_number - start_number))
++					bridge_face = find_bridge_face(estimate_face, frame_faces[frame_number], tracked_faces[frame_number])
++
++					if bridge_face:
++						tracked_faces[frame_number][mapping_index] = bridge_face
++
++	FACE_TRACK_FRAMES.extend(tracked_faces)
++
++	for frame_number, frame_key in enumerate(frame_keys):
++		if frame_key:
++			FACE_TRACK_SET[frame_key] = [ (face, face_mappings[mapping_index]) for mapping_index, face in tracked_faces[frame_number].items() ]
++
++
++def analyse_track_frame(frame_number : int, temp_frame_path : str) -> Tuple[int, Optional[str], List[Face], Dict[int, Face]]:
++	if process_manager.is_stopping():
++		return frame_number, None, [], {}
++
++	# uncached read: a whole video must not pile up in memory, the face store keeps the detections
++	vision_frame = read_image(temp_frame_path)
++
++	if vision_frame is None:
++		return frame_number, None, [], {}
++
++	face_mappings = get_face_mappings()
++	mapping_indices = { id(face_mapping): index for index, face_mapping in enumerate(face_mappings) }
++	target_faces = get_many_faces([ vision_frame ])
++	frame_matches = { mapping_indices.get(id(face_mapping)): target_face for target_face, face_mapping in match_face_mappings(target_faces, face_mappings, state_manager.get_item('reference_face_distance')) }
++	return frame_number, create_frame_key(vision_frame), target_faces, frame_matches
++
++
++def get_face_size(face : Face) -> float:
++	return float(max(face.bounding_box[2] - face.bounding_box[0], face.bounding_box[3] - face.bounding_box[1]))
++
++
++def get_face_center(face : Face) -> Tuple[float, float]:
++	return float((face.bounding_box[0] + face.bounding_box[2]) / 2), float((face.bounding_box[1] + face.bounding_box[3]) / 2)
++
++
++def is_face_bridgeable(start_face : Face, end_face : Face) -> bool:
++	# a short miss leaves the head almost where it was: any real move means a cut or another person, never bridged
++	start_size = get_face_size(start_face)
++	end_size = get_face_size(end_face)
++	face_shift = math.dist(get_face_center(start_face), get_face_center(end_face))
++	return 0.75 < end_size / max(start_size, 1e-6) < 1.33 and face_shift < (start_size + end_size) / 4
++
++
++def interpolate_face(start_face : Face, end_face : Face, progress : float) -> Face:
++	nearest_face = start_face if progress < 0.5 else end_face
++	landmark_set = { landmark_key: start_face.landmark_set.get(landmark_key) * (1 - progress) + end_face.landmark_set.get(landmark_key) * progress for landmark_key in start_face.landmark_set }
++	bounding_box = start_face.bounding_box * (1 - progress) + end_face.bounding_box * progress
++	return nearest_face._replace(bounding_box = bounding_box, landmark_set = landmark_set)
++
++
++def calculate_face_overlap(face : Face, other_face : Face) -> float:
++	start_x = max(face.bounding_box[0], other_face.bounding_box[0])
++	start_y = max(face.bounding_box[1], other_face.bounding_box[1])
++	end_x = min(face.bounding_box[2], other_face.bounding_box[2])
++	end_y = min(face.bounding_box[3], other_face.bounding_box[3])
++	overlap_area = max(0.0, end_x - start_x) * max(0.0, end_y - start_y)
++	union_area = get_bounding_box_area(face) + get_bounding_box_area(other_face) - overlap_area
++	return float(overlap_area / union_area) if union_area > 0 else 0.0
++
++
++def find_bridge_face(estimate_face : Face, target_faces : List[Face], frame_tracked_faces : Dict[int, Face]) -> Optional[Face]:
++	claimed_face_ids = { id(face) for face in frame_tracked_faces.values() }
++	overlap_pairs = [ (calculate_face_overlap(estimate_face, target_face), target_face) for target_face in target_faces ]
++	best_overlap, best_face = max(overlap_pairs, key = lambda overlap_pair: overlap_pair[0], default = (0.0, None))
++
++	if best_face is not None and best_overlap > 0.3:
++		# the face is there but belongs to someone else in this frame: stay away from it
++		if id(best_face) in claimed_face_ids:
++			return None
++		# detected but not recognised (profile, blur): its own landmarks beat any estimate
++		return best_face
++
++	# never stack two people on one spot, even when the other one was bridged too
++	if any(calculate_face_overlap(estimate_face, tracked_face) > 0.3 for tracked_face in frame_tracked_faces.values()):
++		return None
++	return estimate_face
 +
 +
 +def get_face_mapping_source_face(face_mapping : FaceMapping) -> Optional[Face]:
@@ -134,26 +284,25 @@ new file mode 100644
 index 0000000..e69de29
 diff --git a/facefusion/processors/modules/face_sticker/core.py b/facefusion/processors/modules/face_sticker/core.py
 new file mode 100644
-index 0000000..dcd095b
+index 0000000..acf635e
 --- /dev/null
 +++ b/facefusion/processors/modules/face_sticker/core.py
-@@ -0,0 +1,312 @@
+@@ -0,0 +1,285 @@
 +import math
 +from argparse import ArgumentParser
-+from concurrent.futures import ThreadPoolExecutor
 +from functools import lru_cache
 +from typing import Dict, List, Optional, Tuple
 +
 +import cv2
 +import numpy
 +
-+from facefusion import logger, process_manager, state_manager, translator
++from facefusion import logger, state_manager, translator
 +from facefusion.face_analyser import scale_face
-+from facefusion.face_mapper import get_face_mappings, has_face_mapping_sticker, select_sticker_faces
++from facefusion.face_mapper import clear_face_tracks, get_face_mappings, get_tracked_faces, has_face_mapping_sticker, prepare_face_tracks, select_sticker_faces
 +from facefusion.filesystem import in_directory, is_image, is_video, same_file_extension
 +from facefusion.processors.types import ProcessorOutputs
 +from facefusion.types import ApplyStateItem, Args, Face, FaceMapping, FaceStickerOptions, InferencePool, ProcessMode, VisionFrame
-+from facefusion.vision import read_image, read_static_image, read_static_video_frame
++from facefusion.vision import read_static_image, read_static_video_frame
 +
 +FaceStickerAnchor = Tuple[float, float, float, float, float, float]
 +# head pose from the detector's 5 points, gains calibrated against solvePnP on sharp faces
@@ -162,10 +311,8 @@ index 0000000..dcd095b
 +HEAD_PITCH_NEUTRAL = 0.69
 +HEAD_ANGLE_LIMIT = 75.0
 +STICKER_PERSPECTIVE = 3.0
-+# seconds a briefly undetected head keeps its sticker, inside a track and at its edges
-+STICKER_TRACK_GAP = 0.5
-+STICKER_TRACK_HOLD = 0.15
-+STICKER_TRACK_SMOOTHING = 2
++# frames on each side averaged against jitter, never across a cut
++STICKER_TRACK_SMOOTHING = 1
 +STICKER_TRACKS : Dict[int, numpy.ndarray] = {}
 +
 +
@@ -207,6 +354,7 @@ index 0000000..dcd095b
 +
 +def post_process() -> None:
 +	STICKER_TRACKS.clear()
++	clear_face_tracks()
 +	read_sticker_frame.cache_clear()
 +	prepare_sticker_frame.cache_clear()
 +	read_static_image.cache_clear()
@@ -250,7 +398,8 @@ index 0000000..dcd095b
 +
 +def calculate_sticker_anchor(face : Face) -> FaceStickerAnchor:
 +	start_x, start_y, end_x, end_y = face.bounding_box
-+	face_landmark_5 = face.landmark_set.get('5/68')
++	# the detector's own points: '5/68' switches to the 68 landmarks around their confidence threshold and makes the tilt flicker
++	face_landmark_5 = face.landmark_set.get('5')
 +	left_eye, right_eye = face_landmark_5[0], face_landmark_5[1]
 +	face_angle = math.degrees(math.atan2(right_eye[1] - left_eye[1], right_eye[0] - left_eye[0]))
 +	face_size = max(end_x - start_x, end_y - start_y)
@@ -350,12 +499,14 @@ index 0000000..dcd095b
 +	if not sticker_mapping_indices:
 +		return
 +
++	# the shared face tracks already hold every detection plus the bridged misses
++	prepare_face_tracks(temp_frame_paths)
 +	raw_anchors = numpy.full((len(face_mappings), len(temp_frame_paths), 6), numpy.nan)
 +
-+	with ThreadPoolExecutor(max_workers = state_manager.get_item('execution_thread_count')) as executor:
-+		for frame_number, sticker_anchors in executor.map(analyse_sticker_frame, range(len(temp_frame_paths)), temp_frame_paths):
-+			for mapping_index, sticker_anchor in sticker_anchors:
-+				raw_anchors[mapping_index, frame_number] = sticker_anchor
++	for frame_number, tracked_faces in enumerate(get_tracked_faces()):
++		for mapping_index, tracked_face in tracked_faces.items():
++			if mapping_index in sticker_mapping_indices:
++				raw_anchors[mapping_index, frame_number] = calculate_sticker_anchor(tracked_face)
 +
 +	video_fps = state_manager.get_item('output_video_fps') or 25.0
 +
@@ -363,71 +514,43 @@ index 0000000..dcd095b
 +		STICKER_TRACKS[mapping_index] = build_sticker_track(raw_anchors[mapping_index], video_fps)
 +
 +
-+def analyse_sticker_frame(frame_number : int, temp_frame_path : str) -> Tuple[int, List[Tuple[int, FaceStickerAnchor]]]:
-+	sticker_anchors : List[Tuple[int, FaceStickerAnchor]] = []
-+
-+	if process_manager.is_stopping():
-+		return frame_number, sticker_anchors
-+
-+	# uncached read: a whole video must not pile up in memory, the face store still keeps the detections
-+	vision_frame = read_image(temp_frame_path)
-+
-+	if vision_frame is not None:
-+		mapping_indices = { id(face_mapping): index for index, face_mapping in enumerate(get_face_mappings()) }
-+
-+		for target_face, face_mapping in select_sticker_faces(vision_frame):
-+			sticker_anchors.append((mapping_indices.get(id(face_mapping)), calculate_sticker_anchor(target_face)))
-+	return frame_number, sticker_anchors
-+
-+
 +def build_sticker_track(raw_anchors : numpy.ndarray, video_fps : float) -> numpy.ndarray:
++	# short misses are already bridged by the shared face tracks, here the motion only gets smoothed
 +	frame_total = len(raw_anchors)
 +	sticker_track = raw_anchors.copy()
-+	is_detected = ~numpy.isnan(raw_anchors[:, 0])
++	known_numbers = numpy.flatnonzero(~numpy.isnan(raw_anchors[:, 0]))
++	segment_ids = numpy.full(frame_total, -1)
++	segment_id = -1
++	previous_number = None
 +
-+	# a detection that disagrees with its neighbours is a glitch (wrong face, broken landmarks): treat it as a miss
-+	for frame_number in numpy.flatnonzero(is_detected):
-+		neighbour_numbers = [ number for number in range(frame_number - 3, frame_number + 4) if number != frame_number and 0 <= number < frame_total and is_detected[number] ]
++	# a hole or a jump (cut, another person taking over) starts a new segment, nothing is blended across it
++	for frame_number in known_numbers:
++		if previous_number is None or frame_number != previous_number + 1 or is_anchor_jump(raw_anchors[previous_number], raw_anchors[frame_number]):
++			segment_id += 1
++		segment_ids[frame_number] = segment_id
++		previous_number = frame_number
 +
-+		if len(neighbour_numbers) >= 2:
-+			neighbour_anchor = numpy.median(raw_anchors[neighbour_numbers], axis = 0)
-+			face_size = neighbour_anchor[2]
-+			is_moved = math.dist(raw_anchors[frame_number, :2], neighbour_anchor[:2]) > face_size * 0.5
-+			is_resized = abs(raw_anchors[frame_number, 2] - face_size) > face_size * 0.4
-+			is_turned = numpy.abs(raw_anchors[frame_number, 3:] - neighbour_anchor[3:]).max() > 30
++	# a lone pose glitch between two agreeing neighbours takes their angles
++	for frame_number in known_numbers:
++		if 0 < frame_number < frame_total - 1 and segment_ids[frame_number - 1] == segment_ids[frame_number] == segment_ids[frame_number + 1]:
++			neighbour_angles = (raw_anchors[frame_number - 1, 3:] + raw_anchors[frame_number + 1, 3:]) / 2
++			is_agreeing = numpy.abs(raw_anchors[frame_number - 1, 3:] - raw_anchors[frame_number + 1, 3:]).max() < 15
++			is_glitch = numpy.abs(raw_anchors[frame_number, 3:] - neighbour_angles).max() > 25
 +
-+			if is_moved or is_resized or is_turned:
-+				sticker_track[frame_number] = numpy.nan
++			if is_agreeing and is_glitch:
++				sticker_track[frame_number, 3:] = neighbour_angles
 +
-+	# bridge short misses by interpolating between the frames around them
-+	gap_total = max(1, round(video_fps * STICKER_TRACK_GAP))
-+	known_numbers = numpy.flatnonzero(~numpy.isnan(sticker_track[:, 0]))
++	smooth_track = sticker_track.copy()
 +
-+	for start_number, end_number in zip(known_numbers[:-1], known_numbers[1:]):
-+		if 1 < end_number - start_number <= gap_total + 1:
-+			missing_numbers = numpy.arange(start_number + 1, end_number)
-+
-+			for component in range(sticker_track.shape[1]):
-+				sticker_track[missing_numbers, component] = numpy.interp(missing_numbers, [ start_number, end_number ], [ sticker_track[start_number, component], sticker_track[end_number, component] ])
-+
-+	# heads entering or leaving often lose detection a little early: hold the edges briefly
-+	hold_total = round(video_fps * STICKER_TRACK_HOLD)
-+	is_known = ~numpy.isnan(sticker_track[:, 0])
-+	hold_track = sticker_track.copy()
-+
-+	for frame_number in numpy.flatnonzero(is_known):
-+		for hold_number in range(frame_number - hold_total, frame_number + hold_total + 1):
-+			if 0 <= hold_number < frame_total and numpy.isnan(hold_track[hold_number, 0]):
-+				hold_track[hold_number] = sticker_track[frame_number]
-+
-+	# light centred moving average against jitter
-+	is_known = ~numpy.isnan(hold_track[:, 0])
-+	smooth_track = hold_track.copy()
-+
-+	for frame_number in numpy.flatnonzero(is_known):
-+		window_numbers = [ number for number in range(frame_number - STICKER_TRACK_SMOOTHING, frame_number + STICKER_TRACK_SMOOTHING + 1) if 0 <= number < frame_total and is_known[number] ]
-+		smooth_track[frame_number] = hold_track[window_numbers].mean(axis = 0)
++	for frame_number in known_numbers:
++		window_numbers = [ number for number in range(frame_number - STICKER_TRACK_SMOOTHING, frame_number + STICKER_TRACK_SMOOTHING + 1) if 0 <= number < frame_total and segment_ids[number] == segment_ids[frame_number] ]
++		smooth_track[frame_number] = sticker_track[window_numbers].mean(axis = 0)
 +	return smooth_track
++
++
++def is_anchor_jump(anchor : numpy.ndarray, next_anchor : numpy.ndarray) -> bool:
++	face_size = (anchor[2] + next_anchor[2]) / 2
++	return math.dist(anchor[:2], next_anchor[:2]) > face_size * 0.35 or not 0.75 < next_anchor[2] / max(anchor[2], 1e-6) < 1.33
 +
 +
 +def process_frame(inputs : dict) -> ProcessorOutputs:
@@ -451,14 +574,14 @@ index 0000000..dcd095b
 +
 +	return temp_vision_frame, temp_vision_mask
 diff --git a/facefusion/processors/modules/face_swapper/core.py b/facefusion/processors/modules/face_swapper/core.py
-index 9e906ad..10d9c62 100755
+index 9e906ad..e05547e 100755
 --- a/facefusion/processors/modules/face_swapper/core.py
 +++ b/facefusion/processors/modules/face_swapper/core.py
 @@ -13,6 +13,7 @@ from facefusion.common_helper import get_first, is_macos
  from facefusion.download import conditional_download_hashes, conditional_download_sources, resolve_download_url
  from facefusion.execution import has_execution_provider
  from facefusion.face_analyser import get_average_face, get_many_faces, get_one_face, scale_face
-+from facefusion.face_mapper import get_face_mapping_source_face, get_face_mapping_source_frame, has_face_mapping_source, select_mapped_faces
++from facefusion.face_mapper import clear_face_tracks, get_face_mapping_source_face, get_face_mapping_source_frame, has_face_mapping_source, prepare_face_tracks, select_mapped_faces
  from facefusion.face_helper import paste_back, warp_face_by_face_landmark_5
  from facefusion.face_masker import create_area_mask, create_box_mask, create_occlusion_mask, create_region_mask
  from facefusion.face_selector import select_faces, sort_faces_by_order
@@ -496,7 +619,22 @@ index 9e906ad..10d9c62 100755
  
  	if mode in [ 'output', 'preview' ] and not is_image(state_manager.get_item('target_path')) and not is_video(state_manager.get_item('target_path')):
  		logger.error(translator.get('choose_image_or_video_target') + translator.get('exclamation_mark'), __name__)
-@@ -578,7 +584,7 @@ def post_process() -> None:
+@@ -562,7 +568,14 @@ def pre_process(mode : ProcessMode) -> bool:
+ 	return True
+ 
+ 
++def prepare_frames(temp_frame_paths : List[str]) -> None:
++	# mapped faces get tracked across the video, so short detection misses keep their swap
++	if state_manager.get_item('face_selector_mode') == 'mapping':
++		prepare_face_tracks(temp_frame_paths)
++
++
+ def post_process() -> None:
++	clear_face_tracks()
+ 	read_static_image.cache_clear()
+ 	read_static_video_frame.cache_clear()
+ 	video_manager.clear_video_pool()
+@@ -578,7 +591,7 @@ def post_process() -> None:
  		face_recognizer.clear_inference_pool()
  
  
@@ -505,7 +643,7 @@ index 9e906ad..10d9c62 100755
  	model_template = get_model_options().get('template')
  	model_size = get_model_options().get('size')
  	pixel_boost_size = unpack_resolution(state_manager.get_item('face_swapper_pixel_boost'))
-@@ -598,7 +604,7 @@ def swap_face(source_face : Face, target_face : Face, temp_vision_frame : Vision
+@@ -598,7 +611,7 @@ def swap_face(source_face : Face, target_face : Face, temp_vision_frame : Vision
  	pixel_boost_vision_frames = implode_pixel_boost(crop_vision_frame, pixel_boost_total, model_size)
  	for pixel_boost_vision_frame in pixel_boost_vision_frames:
  		pixel_boost_vision_frame = prepare_crop_frame(pixel_boost_vision_frame)
@@ -514,7 +652,7 @@ index 9e906ad..10d9c62 100755
  		pixel_boost_vision_frame = normalize_crop_frame(pixel_boost_vision_frame)
  		temp_vision_frames.append(pixel_boost_vision_frame)
  	crop_vision_frame = explode_pixel_boost(temp_vision_frames, pixel_boost_total, model_size, pixel_boost_size)
-@@ -617,7 +623,7 @@ def swap_face(source_face : Face, target_face : Face, temp_vision_frame : Vision
+@@ -617,7 +630,7 @@ def swap_face(source_face : Face, target_face : Face, temp_vision_frame : Vision
  	return paste_vision_frame
  
  
@@ -523,7 +661,7 @@ index 9e906ad..10d9c62 100755
  	face_swapper = get_inference_pool().get('face_swapper')
  	model_type = get_model_options().get('type')
  	face_swapper_inputs = {}
-@@ -628,7 +634,7 @@ def forward_swap_face(source_face : Face, target_face : Face, crop_vision_frame
+@@ -628,7 +641,7 @@ def forward_swap_face(source_face : Face, target_face : Face, crop_vision_frame
  	for face_swapper_input in face_swapper.get_inputs():
  		if face_swapper_input.name == 'source':
  			if model_type in [ 'blendswap', 'uniface' ]:
@@ -532,7 +670,7 @@ index 9e906ad..10d9c62 100755
  			else:
  				source_embedding = prepare_source_embedding(source_face)
  				source_embedding = balance_source_embedding(source_embedding, target_face.embedding)
-@@ -654,9 +660,11 @@ def forward_convert_embedding(face_embedding : Embedding) -> Embedding:
+@@ -654,9 +667,11 @@ def forward_convert_embedding(face_embedding : Embedding) -> Embedding:
  	return face_embedding
  
  
@@ -546,7 +684,7 @@ index 9e906ad..10d9c62 100755
  
  	if model_type == 'blendswap':
  		source_vision_frame, _ = warp_face_by_face_landmark_5(source_vision_frame, source_face.landmark_set.get('5/68'), 'arcface_112_v2', (112, 112))
-@@ -763,6 +771,16 @@ def process_frame(inputs : FaceSwapperInputs) -> ProcessorOutputs:
+@@ -763,6 +778,16 @@ def process_frame(inputs : FaceSwapperInputs) -> ProcessorOutputs:
  	target_vision_frame = inputs.get('target_vision_frame')
  	temp_vision_frame = inputs.get('temp_vision_frame')
  	temp_vision_mask = inputs.get('temp_vision_mask')
