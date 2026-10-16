@@ -1,3 +1,6 @@
+> **This repository moved.** MultiFace Studio is now a fork of FaceFusion: **https://github.com/cgobbo8/multiface-studio**.
+> This archive keeps the earlier Pinokio launcher that patched FaceFusion at install time. To install or update, use the new repository (in Pinokio, reinstall from its URL).
+
 # MultiFace Studio
 
 **A new face for every person in a photo or a video, in a single pass.**
